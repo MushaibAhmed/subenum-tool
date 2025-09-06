@@ -1,0 +1,6 @@
+aiohttp
+dnspython
+shodan
+python-dotenv
+pyfiglet
+colorama
