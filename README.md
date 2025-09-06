@@ -27,7 +27,7 @@ A CLI-based tool for **subdomain enumeration, liveness detection, IP classificat
 
 Clone the repository:
 ```bash
-git clone https://github.com/YOUR_USERNAME/subenum-tool.git
+git clone https://github.com/MushaibAhmed/subenum-tool.git
 cd subenum-tool
 ```
 
