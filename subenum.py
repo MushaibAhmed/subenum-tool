@@ -1,324 +1,276 @@
 #!/usr/bin/env python3
 """
-subenum.py
-Pipeline:
-1) brute-force + API collectors -> gather candidate subdomains
-2) resolve and check liveness (http/tcp)
-3) extract IPs, classify (private vs public)
-4) query Shodan for public IPs -> ports + CVEs
-
-Includes an ASCII banner (team name) displayed at start.
+async_subenum.py
+Subdomain Bruteforce using Async DNS (Cloudflare)
+Filters duplicates based on IP set (default) unless -df is passed
+Also ensures subdomains are unique across wordlist + API results.
 """
-import argparse, asyncio, aiohttp, json, sys, time
-from concurrent.futures import ThreadPoolExecutor
-import dns.resolver, socket
-import ipaddress
-import shodan
-from typing import List, Dict, Set, Tuple
+
+import asyncio
+import aiodns
+import time
 from pathlib import Path
-from dotenv import load_dotenv
+import argparse
+import aiohttp
 import os
+import json
+import ipaddress
+from dotenv import load_dotenv
 
-load_dotenv()  # allow API keys in .env too
+# ANSI colors
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+RESET = "\033[0m"
 
-# ---------- CONFIG (environment fallback) ----------
-VT_API = os.getenv("VT_API")      # optional VirusTotal API key
-ST_API = os.getenv("ST_API")      # optional SecurityTrails API key
-SHODAN_API = os.getenv("SHODAN_API")  # optional Shodan API key
+# ===== NEW: Ensure .env exists =====
+ENV_PATH = Path.home() / ".env"
+if not ENV_PATH.exists():
+    with open(ENV_PATH, "w") as f:
+        f.write("VIRUSTOTAL_API_KEY=\n")
+        f.write("SECURITYTRAILS_API_KEY=\n")
+        f.write("ALIENVAULT_API_KEY=\n")
+    print(f"{YELLOW}[+] Created {ENV_PATH} with placeholder API keys{RESET}")
 
-# ---------- OPTIONAL BANNER HELPERS ----------
-def print_banner(team_name: str = "Cyber Hunters", font: str = "slant", use_color: bool = True):
-    """
-    Try to print a nice ASCII banner using pyfiglet and colorama if available.
-    Falls back to plain text if libraries are missing.
-    """
-    banner_text = None
+load_dotenv(ENV_PATH)
+
+# ===== Helper: check if IP is public or private =====
+def ip_type(ip: str) -> str:
     try:
-        import pyfiglet
-        banner_text = pyfiglet.figlet_format(team_name, font=font)
-    except Exception:
-        banner_text = f"=== {team_name} ===\\n"
+        ip_obj = ipaddress.ip_address(ip)
+        return "Private" if ip_obj.is_private else "Public"
+    except ValueError:
+        return "Unknown"
 
-    # colorize if colorama available and requested
-    if use_color:
-        try:
-            from colorama import Fore, Style, init as color_init
-            color_init(autoreset=True)
-            print(Fore.CYAN + banner_text + Style.RESET_ALL)
-            print("=" * 70)
-            return
-        except Exception:
-            pass
+# ===== Output saving =====
+def save_results(domain, live_subdomains, elapsed, txt_file=None, json_file=None):
+    if txt_file:
+        # ---- TXT Format ----
+        txt_lines = []
+        for sub, ips in live_subdomains:
+            txt_lines.append(f"[LIVE] {sub}")
+            for ip in ips:
+                txt_lines.append(f"    IP: {ip} ({ip_type(ip)})")
+            txt_lines.append("")  # spacing
+        txt_lines.append(f"Total unique live subdomains: {len(live_subdomains)}")
+        txt_lines.append(f"Scan completed in {elapsed:.2f} seconds")
 
-    print(banner_text)
-    print("=" * 70)
+        with open(txt_file, "w") as f:
+            f.write("\n".join(txt_lines))
+        print(f"{YELLOW}[+] TXT results saved to {txt_file}{RESET}")
 
+    if json_file:
+        # ---- JSON Format ----
+        results_json = {
+            "domain": domain,
+            "total_live_subdomains": len(live_subdomains),
+            "scan_time_seconds": round(elapsed, 2),
+            "results": []
+        }
+        for sub, ips in live_subdomains:
+            results_json["results"].append({
+                "subdomain": sub,
+                "ips": [{"ip": ip, "type": ip_type(ip)} for ip in ips]
+            })
 
-# ---------- UTIL ----------
-def is_private_ip(ip_str: str) -> bool:
+        with open(json_file, "w") as f:
+            json.dump(results_json, f, indent=4)
+        print(f"{YELLOW}[+] JSON results saved to {json_file}{RESET}")
+
+# ===== Original function =====
+async def resolve_subdomain(resolver, subdomain):
+    """Check if subdomain resolves using DNS (Cloudflare)."""
     try:
-        return ipaddress.ip_address(ip_str).is_private
-    except Exception:
-        return False
+        result_a = await resolver.query(subdomain, 'A')
+        ips = sorted({r.host for r in result_a})
+        return subdomain, ips
+    except aiodns.error.DNSError:
+        return None, None
 
-# ---------- COLLECTORS ----------
-async def vt_subdomains(session: aiohttp.ClientSession, domain: str, api_key: str) -> Set[str]:
-    """VirusTotal v3: /domains/{domain}/subdomains (requires key)."""
-    if not api_key:
-        return set()
-    url = f"https://www.virustotal.com/api/v3/domains/{domain}/subdomains"
-    headers = {"x-apikey": api_key}
-    subs = set()
-    try:
-        async with session.get(url, headers=headers, timeout=20) as resp:
-            if resp.status != 200:
-                return subs
-            data = await resp.json()
-            for item in data.get("data", []):
-                # vt may return id like "sub.example.com"
-                name = item.get("id") or item.get("attributes", {}).get("name")
-                if name and name.endswith(domain):
-                    subs.add(name)
-    except Exception:
-        pass
-    return subs
+# ===== Modified brute-force with filtering toggle =====
+async def brute_force_subdomains(domain, wordlist_path, seen_subdomains, filter_ip=True, concurrency=200):
+    """Run subdomain brute-force using async DNS resolution."""
+    resolver = aiodns.DNSResolver()
+    resolver.nameservers = ['1.1.1.1', '1.0.0.1']  # Cloudflare DNS
 
-async def st_subdomains(session: aiohttp.ClientSession, domain: str, api_key: str) -> Set[str]:
-    """SecurityTrails v1: /v1/domain/{domain}/subdomains (requires key)."""
-    if not api_key:
-        return set()
-    url = f"https://api.securitytrails.com/v1/domain/{domain}/subdomains"
-    headers = {"APIKEY": api_key}
-    subs = set()
-    try:
-        async with session.get(url, headers=headers, params={"children_only": False}, timeout=20) as resp:
-            if resp.status != 200:
-                return subs
-            data = await resp.json()
-            # ST returns list of subdomain fragments; append domain to get FQDN
-            for s in data.get("subdomains", []):
-                fqdn = f"{s}.{domain}"
-                subs.add(fqdn)
-    except Exception:
-        pass
-    return subs
+    # Load wordlist
+    words = []
+    with open(wordlist_path, "r", errors="ignore") as f:
+        for line in f:
+            word = line.strip()
+            if word and not word.startswith("#"):
+                words.append(f"{word}.{domain}")
 
-def brute_force_from_wordlist(domain: str, wordlist_path: str, max_entries: int = 200000) -> Set[str]:
-    subs = set()
-    p = Path(wordlist_path)
-    if not p.exists():
-        return subs
-    with p.open("r", errors="ignore") as fh:
-        for i, line in enumerate(fh):
-            if i >= max_entries:
-                break
-            w = line.strip()
-            if not w or w.startswith("#"):
-                continue
-            subs.add(f"{w}.{domain}")
-    return subs
+    print(f"{YELLOW}[+] Loaded {len(words)} subdomain candidates{RESET}")
 
-# ---------- RESOLUTION ----------
-def resolve_name(name: str, resolver=None, timeout=5) -> List[str]:
-    """Resolve A and AAAA (blocking)"""
-    ips = set()
-    try:
-        r = resolver or dns.resolver.Resolver()
-        r.lifetime = timeout
-        try:
-            ans = r.resolve(name, "A", lifetime=timeout)
-            for rr in ans:
-                ips.add(rr.to_text())
-        except Exception:
-            pass
-        try:
-            ans = r.resolve(name, "AAAA", lifetime=timeout)
-            for rr in ans:
-                ips.add(rr.to_text())
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return list(ips)
+    live_subdomains = []
+    seen_items = set()
+    sem = asyncio.Semaphore(concurrency)
 
-# ---------- LIVENESS CHECK ----------
-async def http_check(session: aiohttp.ClientSession, url: str, timeout=6) -> bool:
-    try:
-        async with session.head(url, timeout=timeout, allow_redirects=True) as r:
-            return r.status < 400
-    except Exception:
-        # try GET as fallback
-        try:
-            async with session.get(url, timeout=timeout, allow_redirects=True) as r2:
-                return r2.status < 400
-        except Exception:
-            return False
+    async def worker(sub):
+        async with sem:
+            sub, ips = await resolve_subdomain(resolver, sub)
+            if sub and ips:
+                # 🔑 Global filter by subdomain name
+                if sub in seen_subdomains:
+                    return
+                seen_subdomains.add(sub)
 
-async def tcp_port_open(ip: str, port: int, timeout=3) -> bool:
-    try:
-        fut = asyncio.open_connection(ip, port)
-        reader, writer = await asyncio.wait_for(fut, timeout=timeout)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return True
-    except Exception:
-        return False
+                # Existing IP filtering
+                key = tuple(ips) if filter_ip else sub
+                if key not in seen_items:
+                    seen_items.add(key)
+                    live_subdomains.append((sub, ips))
+                    print(f"{GREEN}[LIVE]{RESET} {sub} -> {', '.join(ips)}")
 
-async def is_live(subdomain: str, resolved_ips: List[str], session: aiohttp.ClientSession, timeout=6) -> Tuple[bool, str]:
-    # Try HTTPS then HTTP (SNI). If resolved_ips empty, skip to failure
-    schemes = ["https://", "http://"]
-    for s in schemes:
-        url = s + subdomain
-        ok = await http_check(session, url, timeout=timeout)
-        if ok:
-            return True, f"{s}"
-    # fallback: try TCP connect on common ports to each resolved IP
-    common_ports = [443, 80]
-    for ip in resolved_ips:
-        for p in common_ports:
-            if await tcp_port_open(ip, p, timeout=3):
-                return True, f"tcp:{ip}:{p}"
-    return False, ""
+    await asyncio.gather(*[worker(sub) for sub in words])
+    return live_subdomains
 
-# ---------- SHODAN ----------
-def shodan_query(api_key: str, ip: str) -> Dict:
-    if not api_key:
-        return {}
-    try:
-        sh = shodan.Shodan(api_key)
-        info = sh.host(ip)  # may raise shodan.APIError
-        ports = info.get("ports", [])
-        vulns = info.get("vulns") or info.get("vulnerability") or []
-        return {"ports": ports, "vulns": vulns, "raw": info}
-    except Exception as e:
-        return {"error": str(e)}
+# ===== API subdomain fetching =====
+async def fetch_api_subdomains(domain):
+    api_results = set()
 
-# ---------- MAIN PIPELINE ----------
-async def run_pipeline(domain: str, wordlist: str, vt_key: str, st_key: str, shodan_key: str,
-                       threads: int = 50, timeout: int = 6, out_file: str = None):
-    start = time.time()
-    candidates = set()
-
-    # 1) bruteforce
-    if wordlist:
-        print("[*] Running brute-force wordlist...")
-        bf = brute_force_from_wordlist(domain, wordlist)
-        print(f"[+] Bruteforce produced {len(bf)} candidates")
-        candidates |= bf
-
-    # 2) API collectors (async)
     async with aiohttp.ClientSession() as session:
-        api_tasks = []
+        # VirusTotal
+        vt_key = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
         if vt_key:
-            api_tasks.append(vt_subdomains(session, domain, vt_key))
+            vt_url = f"https://www.virustotal.com/api/v3/domains/{domain}/subdomains"
+            headers = {"x-apikey": vt_key}
+            try:
+                async with session.get(vt_url, headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        for item in data.get("data", []):
+                            api_results.add(item.get("id"))
+                        next_link = data.get("links", {}).get("next")
+                        while next_link:
+                            async with session.get(next_link, headers=headers) as r2:
+                                if r2.status != 200:
+                                    break
+                                data2 = await r2.json()
+                                for item in data2.get("data", []):
+                                    api_results.add(item.get("id"))
+                                next_link = data2.get("links", {}).get("next")
+                        print(f"{YELLOW}[+] VirusTotal returned {len(api_results)} subdomains{RESET}")
+                    else:
+                        text = await r.text()
+                        print(f"{RED}[-] VirusTotal API status {r.status}: {text}{RESET}")
+            except Exception as e:
+                print(f"{RED}[-] VirusTotal API error: {e}{RESET}")
+
+        # SecurityTrails
+        st_key = os.getenv("SECURITYTRAILS_API_KEY", "").strip()
         if st_key:
-            api_tasks.append(st_subdomains(session, domain, st_key))
-        if api_tasks:
-            print("[*] Querying APIs...")
-            results = await asyncio.gather(*api_tasks)
-            for r in results:
-                candidates |= r
-            print(f"[+] Total candidates after APIs: {len(candidates)}")
+            st_url = f"https://api.securitytrails.com/v1/domain/{domain}/subdomains"
+            headers = {"APIKEY": st_key}
+            try:
+                async with session.get(st_url, headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        subs = data.get("subdomains", [])
+                        for s in subs:
+                            api_results.add(f"{s}.{domain}")
+                        print(f"{YELLOW}[+] SecurityTrails returned {len(subs)} subdomains{RESET}")
+                    else:
+                        text = await r.text()
+                        print(f"{RED}[-] SecurityTrails API status {r.status}: {text}{RESET}")
+            except Exception as e:
+                print(f"{RED}[-] SecurityTrails API error: {e}{RESET}")
 
-        # dedupe & normalize
-        candidates = {c.lower().strip() for c in candidates if c and c.endswith(domain)}
-        candidate_list = list(candidates)  # preserve fixed order for task mapping
+        # AlienVault OTX
+        av_key = os.getenv("ALIENVAULT_API_KEY", "").strip()
+        if av_key:
+            av_url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
+            headers = {"X-OTX-API-KEY": av_key}
+            try:
+                async with session.get(av_url, headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        for entry in data.get("passive_dns", []):
+                            hostname = entry.get("hostname")
+                            if hostname:
+                                api_results.add(hostname)
+                        print(f"{YELLOW}[+] AlienVault returned {len(data.get('passive_dns', []))} subdomains{RESET}")
+                    else:
+                        text = await r.text()
+                        print(f"{RED}[-] AlienVault API status {r.status}: {text}{RESET}")
+            except Exception as e:
+                print(f"{RED}[-] AlienVault API error: {e}{RESET}")
 
-        # 3) Resolve concurrently using ThreadPool
-        print("[*] Resolving candidate names (A/AAAA)...")
-        resolver = dns.resolver.Resolver()
-        loop = asyncio.get_running_loop()
-        resolved_map = {}  # sub -> [ips]
-        with ThreadPoolExecutor(max_workers=threads) as pool:
-            tasks = []
-            for name in candidate_list:
-                tasks.append(loop.run_in_executor(pool, resolve_name, name, resolver, timeout))
-            reslist = await asyncio.gather(*tasks)
-        for name, ips in zip(candidate_list, reslist):
-            if ips:
-                resolved_map[name] = ips
+    return sorted(s for s in api_results if s and s.endswith(domain))
 
-        print(f"[+] Resolved {len(resolved_map)} names to IP(s)")
+# ===== Resolve API subdomains =====
+async def resolve_api_subdomains(subdomains, seen_subdomains, filter_ip=True, concurrency=200):
+    resolver = aiodns.DNSResolver()
+    resolver.nameservers = ['1.1.1.1', '1.0.0.1']
 
-        # 4) Liveness check (async)
-        print("[*] Checking if resolved names are live (http/tcp)...")
-        live_map = {}  # sub -> {"ips":[], "live":True, "how": "..."}
-        sem = asyncio.Semaphore(200)
-        async def check_one(sub, ips):
-            async with sem:
-                ok, how = await is_live(sub, ips, session, timeout=timeout)
-                return sub, ok, how
+    live_subdomains = []
+    seen = set()   # still used for IP-based deduplication
+    sem = asyncio.Semaphore(concurrency)
 
-        check_tasks = [check_one(s, ips) for s, ips in resolved_map.items()]
-        results = await asyncio.gather(*check_tasks)
-        for sub, ok, how in results:
-            if ok:
-                live_map[sub] = {"ips": resolved_map.get(sub, []), "how": how}
+    async def worker(sub):
+        async with sem:
+            sub_resolved, ips = await resolve_subdomain(resolver, sub)
+            if sub_resolved and ips:
+                # 🔑 Global filter by subdomain name
+                if sub_resolved in seen_subdomains:
+                    return
+                seen_subdomains.add(sub_resolved)
 
-        print(f"[+] {len(live_map)} live subdomains")
+                # Existing IP filtering
+                key = tuple(ips) if filter_ip else sub_resolved
+                if key not in seen:
+                    seen.add(key)
+                    live_subdomains.append((sub_resolved, ips))
+                    print(f"{GREEN}[LIVE]{RESET} {sub_resolved} -> {', '.join(ips)}")
 
-        # 5) Classify IPs and run Shodan for public IPs
-        aggregated = {}
-        public_ips = set()
-        for sub, info in live_map.items():
-            ips = info["ips"]
-            priv = [ip for ip in ips if is_private_ip(ip)]
-            pub = [ip for ip in ips if not is_private_ip(ip)]
-            for ip in pub:
-                public_ips.add(ip)
-            aggregated[sub] = {"ips": ips, "private": priv, "public": pub, "how": info["how"]}
+    if subdomains:
+        await asyncio.gather(*[worker(sub) for sub in subdomains])
+    return live_subdomains
 
-        shodan_results = {}
-        if shodan_key and public_ips:
-            print("[*] Querying Shodan for public IPs...")
-            # run in threadpool (shodan lib is sync)
-            with ThreadPoolExecutor(max_workers=10) as pool:
-                futs = [loop.run_in_executor(pool, shodan_query, shodan_key, ip) for ip in public_ips]
-                sh_res = await asyncio.gather(*futs)
-            for ip, r in zip(list(public_ips), sh_res):
-                shodan_results[ip] = r
+# ===== Main =====
+async def main():
+    parser = argparse.ArgumentParser(
+        description="Subdomain Enumeration Tool\nFiltering is ON by default, but you can turn it off.\n"
+                    "Using -df (dont filter by IP) can reveal more subdomains, such as virtual hosts."
+    )
+    parser.add_argument("domain", help="Target domain (e.g. example.com)")
+    parser.add_argument("-w", "--wordlist", help="Path to subdomain wordlist")
+    parser.add_argument("--api", action="store_true", help="Use API-based enumeration")
+    parser.add_argument("-df", "--dont-filter-ip", action="store_true", help="Do not filter by IP set (keep all subdomains)")
+    parser.add_argument("-oT", "--output-txt", help="Save results in TXT format to given file")
+    parser.add_argument("-oJ", "--output-json", help="Save results in JSON format to given file")
+    args = parser.parse_args()
 
-        # prepare final report
-        report = {"domain": domain, "timestamp": int(time.time()), "subdomains": aggregated, "shodan": shodan_results}
-        if out_file:
-            with open(out_file, "w") as fh:
-                json.dump(report, fh, indent=2)
-            print(f"[+] Wrote report to {out_file}")
-        else:
-            print(json.dumps(report, indent=2))
+    filter_ip = not args.dont_filter_ip
+    seen_subdomains = set()  # 🔑 Global subdomain-name filter
 
-    print(f"[+] Done in {time.time()-start:.1f}s")
+    start_time = time.time()
+    print(f"{YELLOW}[+] Starting async subdomain enumeration for {args.domain}{RESET}")
+    print(f"{YELLOW}[i] Filtering by IP is {'ON' if filter_ip else 'OFF'}{RESET}")
 
+    live_subs_total = []
+
+    if args.wordlist:
+        live_subs = await brute_force_subdomains(args.domain, Path(args.wordlist), seen_subdomains, filter_ip=filter_ip)
+        live_subs_total.extend(live_subs)
+
+    if args.api:
+        print(f"{YELLOW}[+] Fetching subdomains from APIs...{RESET}")
+        api_subs = await fetch_api_subdomains(args.domain)
+        print(f"{YELLOW}[+] Resolving API subdomains...{RESET}")
+        live_api = await resolve_api_subdomains(api_subs, seen_subdomains, filter_ip=filter_ip)
+        live_subs_total.extend(live_api)
+
+    elapsed = time.time() - start_time
+    print(f"\n{GREEN}[+] Found {len(live_subs_total)} unique live subdomains in {elapsed:.2f} seconds{RESET}")
+
+    # ===== Save results only if flags provided =====
+    if args.output_txt or args.output_json:
+        save_results(args.domain, live_subs_total, elapsed, txt_file=args.output_txt, json_file=args.output_json)
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Subdomain enumeration pipeline with banner")
-    p.add_argument("-d", "--domain", required=True, help="Target domain (e.g. example.com)")
-    p.add_argument("-w", "--wordlist", default=None, help="Path to wordlist for bruteforce")
-    p.add_argument("--vt-key", default=None, help="VirusTotal API key (optional)")
-    p.add_argument("--st-key", default=None, help="SecurityTrails API key (optional)")
-    p.add_argument("--shodan-key", default=None, help="Shodan API key (optional)")
-    p.add_argument("--threads", type=int, default=50, help="Resolver threadpool size")
-    p.add_argument("--timeout", type=int, default=6, help="Network timeout seconds")
-    p.add_argument("-o", "--out", default=None, help="Write JSON output to file")
-    # banner options
-    p.add_argument("--team", default="Cyber Hunters", help="Team name to display in banner")
-    p.add_argument("--font", default="slant", help="pyfiglet font for banner (e.g. slant, block, digital)")
-    p.add_argument("--no-color", action="store_true", help="Disable colored banner output")
-    args = p.parse_args()
-
-    # prefer CLI args, fallback to environment
-    vt = args.vt_key or VT_API
-    st = args.st_key or ST_API
-    sh = args.shodan_key or SHODAN_API
-
-    # print banner
-    print_banner(team_name=args.team, font=args.font, use_color=(not args.no_color))
-
     try:
-        asyncio.run(run_pipeline(args.domain, args.wordlist, vt, st, sh, args.threads, args.timeout, args.out))
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("Interrupted", file=sys.stderr)
-        sys.exit(1)
+        print(f"{RED}[-] Interrupted by user{RESET}")
