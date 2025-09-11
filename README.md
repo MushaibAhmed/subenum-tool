@@ -1,7 +1,3 @@
-# Subdomain Enumeration Tool
-
-`subenum.py` is a high-speed, asynchronous subdomain enumeration tool that uses **async DNS resolution** and integrates with multiple APIs for passive subdomain discovery.  
-It is designed to minimize duplicate results and optionally filter subdomains based on their resolved IP addresses.
 
 ---
 
