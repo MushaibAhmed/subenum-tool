@@ -6,6 +6,7 @@ Optionally runs Shodan lookups in parallel for public IPs
 """
 
 import asyncio
+import sys
 import aiodns
 import time
 from pathlib import Path
@@ -15,14 +16,57 @@ import os
 import json
 import ipaddress
 from dotenv import load_dotenv
-
+# ======BANNER ART====
+BANNER_ART = """
+ ██████╗██╗   ██╗██████╗ ███████╗██████╗     ██╗  ██╗██╗   ██╗███╗   ██╗████████╗███████╗██████╗ ███████╗
+██╔════╝╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗    ██║  ██║██║   ██║████╗  ██║╚══██╔══╝██╔════╝██╔══██╗██╔════╝
+██║      ╚████╔╝ ██████╔╝█████╗  ██████╔╝    ███████║██║   ██║██╔██╗ ██║   ██║   █████╗  ██████╔╝███████╗
+██║       ╚██╔╝  ██╔══██╗██╔══╝  ██╔══██╗    ██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══╝  ██╔══██╗╚════██║
+╚██████╗   ██║   ██████╔╝███████╗██║  ██║    ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║███████║
+ ╚═════╝   ╚═╝   ╚═════╝ ╚══════╝╚═╝  ╚═╝    ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝╚══════╝
+"""
 # ===== Colors =====
-GREEN = "\033[92m"
-RED = "\033[91m"
-YELLOW = "\033[93m"
-RESET = "\033[0m"
+BLACK   = "\033[30m"
+RED     = "\033[31m"
+GREEN   = "\033[32m"
+YELLOW  = "\033[33m"
+BLUE    = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN    = "\033[36m"
+WHITE   = "\033[37m"
+RESET   = "\033[0m"
+BRIGHT_RED     = "\033[91m"
+BRIGHT_GREEN   = "\033[92m"
+BRIGHT_YELLOW  = "\033[93m"
+BRIGHT_BLUE    = "\033[94m"
+BRIGHT_MAGENTA = "\033[95m"
+BRIGHT_CYAN    = "\033[96m"
+BRIGHT_WHITE   = "\033[97m"
+# ===== Banner =====
+import shutil
+import itertools
+import random
 
-# ===== Ensure .env =====
+COLORS = [RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN, BRIGHT_RED, BRIGHT_GREEN, BRIGHT_YELLOW, BRIGHT_BLUE]
+SUB_COLOR=[RED,GREEN,BLUE,YELLOW]
+
+def print_centered(text, color=""):
+    width = shutil.get_terminal_size((80, 20)).columns  # fallback 80 cols
+    for line in text.splitlines():
+        print(color + line.center(width) + RESET)
+
+def print_banner():
+    subtitle = ">>> Black Byt3 Cyber Hunters <<<"
+    contact = "LinkedIn: Black Byt3 | Email: blackbyt3.info@gmail.com"
+    color = random.choice(COLORS)   # pick a random color
+    sub_color=random.choice(SUB_COLOR)
+    print_centered(BANNER_ART, color)
+    print_centered(subtitle,sub_color)
+    print_centered(contact)
+    print()
+print_banner()
+
+# ===== NEW: Ensure .env exists =====
 ENV_PATH = Path.home() / ".env"
 if not ENV_PATH.exists():
     with open(ENV_PATH, "w") as f:
@@ -57,7 +101,10 @@ def save_results(domain, live_subdomains, elapsed, shodan_results=None, txt_file
             for ip in ips:
                 lines.append(f"    IP: {ip} ({ip_type(ip)})")
                 if shodan_results and ip in shodan_results:
-                    lines.append(f"        Shodan: {json.dumps(shodan_results[ip], indent=4)}")
+                    info = shodan_results[ip]
+                    lines.append(f"        Shodan: {json.dumps(info, indent=4)}")
+                    if info.get("cves"):
+                        lines.append(f"        CVEs: {', '.join(info['cves'])}")
             lines.append("")
         lines.append(f"Total unique live subdomains: {len(live_subdomains)}")
         lines.append(f"Scan completed in {elapsed:.2f} seconds")
@@ -76,7 +123,8 @@ def save_results(domain, live_subdomains, elapsed, shodan_results=None, txt_file
                         {
                             "ip": ip,
                             "type": ip_type(ip),
-                            "shodan": shodan_results.get(ip) if shodan_results else None
+                            "shodan": shodan_results.get(ip) if shodan_results else None,
+                            "cves": shodan_results.get(ip, {}).get("cves", [])
                         }
                         for ip in ips
                     ]
@@ -86,6 +134,65 @@ def save_results(domain, live_subdomains, elapsed, shodan_results=None, txt_file
         }
         Path(json_file).write_text(json.dumps(data, indent=4))
         print(f"{YELLOW}[+] JSON results saved to {json_file}{RESET}")
+# ===== HTML Output =====
+def generate_html_report(domain, live_subdomains, elapsed, output_html="report.html", shodan_results=None):
+    """
+    Generate HTML report with banner, subdomains, and metadata + Shodan info.
+    """
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Subdomain Report - {domain}</title>
+<style>
+ body {{ font-family: monospace; background: #0b0f14; color: #e6eef6; }}
+ .banner {{ white-space: pre; text-align: center; color: #7bed9f; }}
+ h1 {{ text-align: center; color: #ffd86b; }}
+ table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+ th, td {{ padding: 8px; border-bottom: 1px solid #333; vertical-align: top; }}
+ th {{ background: #1f2a38; color: #ffd86b; }}
+ .meta {{ margin: 10px 0; text-align: center; color: #9fb0cc; }}
+ .shodan {{ color: #ff7675; font-size: 0.9em; margin-left: 15px; }}
+</style>
+</head>
+<body>
+<div class="banner">{BANNER_ART}</div>
+<h1>Black Byt3 Cyber Hunters</h1>
+<div class="meta">
+Domain: {domain} <br>
+Live subdomains: {len(live_subdomains)} <br>
+Scan completed in {elapsed:.2f} seconds
+</div>
+<table>
+<tr><th>Subdomain</th><th>IP(s) + Shodan Info</th></tr>
+"""
+
+    for sub, ips in live_subdomains:
+        ip_rows = []
+        for ip in ips:
+            ip_info = f"{ip} ({ip_type(ip)})"
+            if shodan_results and ip in shodan_results and shodan_results[ip]:
+                shodan_info = shodan_results[ip]
+                ip_info += "<div class='shodan'>"
+                ip_info += f"Org: {shodan_info.get('org', 'N/A')}<br>"
+                ip_info += f"ASN: {shodan_info.get('asn', 'N/A')}<br>"
+                ip_info += f"Country: {shodan_info.get('country', 'N/A')}<br>"
+                ip_info += f"Open Ports: {', '.join(map(str, shodan_info.get('open_ports', [])))}<br>"
+                if shodan_info.get("cves"):
+                    ip_info += f"<b>CVEs:</b> {', '.join(shodan_info['cves'])}<br>"                
+                ip_info += "</div>"
+            ip_rows.append(ip_info)
+        ip_html = "<br><br>".join(ip_rows)
+        html += f"<tr><td>{sub}</td><td>{ip_html}</td></tr>"
+
+    html += """
+</table>
+</body>
+</html>
+"""
+    Path(output_html).write_text(html, encoding="utf-8")
+    print(f"{YELLOW}[+] HTML report saved to {output_html}{RESET}")
 
 # ===== DNS Resolver =====
 async def resolve_subdomain(resolver, subdomain):
@@ -205,38 +312,88 @@ def format_shodan_data(raw_data):
     for ip, data in raw_data.items():
         if not data:
             continue
+
+        # Collect open ports
+        ports = sorted(data.get("ports", [])) if "ports" in data else []
+
+        # Collect CVEs from all service banners
+        cves = set()
+        for banner in data.get("data", []):
+            vulns = banner.get("vulns", {})
+            if vulns:
+                cves.update(vulns.keys())
+
         formatted[ip] = {
             "country": data.get("country_name"),
             "org": data.get("org"),
             "asn": data.get("asn"),
             "region": data.get("region_code"),
             "tags": data.get("tags", []),
-            "open_ports": sorted(data.get("ports", [])) if "ports" in data else []
+            "open_ports": ports,
+            "cves": sorted(cves) if cves else []
         }
     return formatted
 
 # ===== Shodan Async =====
-async def query_shodan_async(ip_list, shodan_api_key, fast_mode=False):
+async def query_shodan_async(ip_list, shodan_api_key):
     if not shodan_api_key:
         print(f"{RED}[!] No Shodan API key provided. Skipping Shodan lookups.{RESET}")
         return {}
-
+        
     async def fetch_shodan(ip):
-        try:
+         try:
             url = f"https://api.shodan.io/shodan/host/{ip}?key={shodan_api_key}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.json()
+                        print(f"{GREEN}[SHODAN][OK] {ip} -> {len(data.get('ports', []))} open ports{RESET}")
                         return (ip, data)
-        except Exception as e:
-            print(f"[!] Shodan lookup failed for {ip}: {e}")
-        return None
+         except Exception:
+           pass
+         return None
+
 
     tasks = [fetch_shodan(ip) for ip in ip_list]
     results = await asyncio.gather(*tasks)
     shodan_data = {ip: data for r in results if r is not None for ip, data in [r]}
     return format_shodan_data(shodan_data)
+
+def print_help():
+    print(f"""
+{GREEN}usage:{RESET} subenum.py [options] {CYAN}domain{RESET}
+
+{YELLOW}Subdomain Enumeration Tool with Shodan Integration{RESET}
+
+{CYAN}Positional arguments:{RESET}
+  {GREEN}domain{RESET}                Target domain (e.g. {YELLOW}example.com{RESET})
+
+{CYAN}Options:{RESET}
+  {GREEN}-h{RESET}, {GREEN}--help{RESET}            Show this help message and exit
+  {GREEN}-w{RESET}, {GREEN}--wordlist WORDLIST{RESET}
+                        Path to subdomain wordlist
+  {GREEN}--api{RESET}                 Use API-based enumeration
+  {GREEN}--shodan{RESET}              Run Shodan lookups
+  {GREEN}-df{RESET}, {GREEN}--dont-filter-ip{RESET}
+                        Do not filter results by IP — shows additional
+                        virtual-host style subdomains and alias names
+  {GREEN}-oT{RESET}, {GREEN}--output-txt FILE{RESET}
+                        Save results in TXT format
+  {GREEN}-oJ{RESET}, {GREEN}--output-json FILE{RESET}
+                        Save results in JSON format
+  {GREEN}-oH{RESET}, {GREEN}--output-html FILE{RESET}
+                        Save results in HTML format
+
+{CYAN}Examples:{RESET}
+  {GREEN}# Brute-force with a wordlist and save JSON{RESET}
+    python3 subenum.py {YELLOW}example.com{RESET} -w subs.txt -oJ results.json
+
+  {GREEN}# API enumeration + Shodan enrichment, save HTML{RESET}
+    python3 subenum.py {YELLOW}example.com{RESET} --api --shodan -oH report.html
+
+  {GREEN}# Include more hostnames (disable IP filtering){RESET}
+    python3 subenum.py {YELLOW}example.com{RESET} -w subs.txt -df
+""")
 
 # ===== Main =====
 async def main():
@@ -245,10 +402,14 @@ async def main():
     parser.add_argument("-w", "--wordlist", help="Path to subdomain wordlist")
     parser.add_argument("--api", action="store_true", help="Use API-based enumeration")
     parser.add_argument("--shodan", action="store_true", help="Run Shodan lookups")
-    parser.add_argument("--fast", action="store_true", help="Run Shodan without delay (may hit rate limits)")
     parser.add_argument("-df", "--dont-filter-ip", action="store_true", help="Do not filter by IP set")
     parser.add_argument("-oT", "--output-txt", help="Save results in TXT format")
     parser.add_argument("-oJ", "--output-json", help="Save results in JSON format")
+    parser.add_argument("-oH", "--output-html", help="Save results in HTML format to given file")
+    if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
+      print_help()
+      sys.exit(0)
+
     args = parser.parse_args()
 
     filter_ip = not args.dont_filter_ip
@@ -276,10 +437,14 @@ async def main():
     shodan_results = {}
     if args.shodan:
         public_ips = sorted({ip for _, ips in live_subs_total for ip in ips if ip_type(ip) == "Public"})
-        shodan_results = await query_shodan_async(public_ips, SHODAN_API_KEY, fast_mode=args.fast)
+        print(f"{YELLOW}[+] Shodan lookups requested. Querying {len(public_ips)} public IP(s)...{RESET}")
+        shodan_results = await query_shodan_async(public_ips, SHODAN_API_KEY)
 
     if args.output_txt or args.output_json:
         save_results(args.domain, live_subs_total, elapsed, shodan_results, txt_file=args.output_txt, json_file=args.output_json)
+    #===HTML FORMAT======
+    if args.output_html:
+        generate_html_report(args.domain, live_subs_total, elapsed, output_html=args.output_html, shodan_results=shodan_results)
 
 if __name__ == "__main__":
     try:
