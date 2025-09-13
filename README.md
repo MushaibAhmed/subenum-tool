@@ -78,11 +78,17 @@ Shodan mode (requires API keys):
 python3 subenum.py example.com -w wordlist.txt --api --shodan
 ```
 
+To view the full result like open ports and CVE's:
+```bash
+python3 subenum.py example.com -w wordlist.txt --api --shodan -oH fileName.html
+```
+And use other flags like -oT for txt format and -oJ for json format.
+
 ---
 
 ## 🔑 API Keys
 
-Create a `.env` file in the project root:
+While runing the command first time it's automatically generate a `.env` file:
 
 ```env
 VT_API=your_virustotal_api_key
